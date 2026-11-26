@@ -19,12 +19,12 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from faster_coco_eval import COCO, COCOeval_faster
 
-from uhd.data import YoloDataset, detection_collate
+from uhd.data import YoloDataset, detection_collate, split_items
 from uhd.losses import anchor_loss, anchor_attr_loss, centernet_loss, detr_loss
 from uhd.metrics import decode_anchor, decode_centernet, decode_detr, evaluate_map
 from uhd.backbones import load_dinov3_backbone
 from uhd.models import build_model
-from uhd.utils import default_device, ensure_dir, move_targets, set_seed
+from uhd.utils import default_device, ensure_dir, move_targets, safe_torch_load, set_seed
 from uhd.resize import (
     Y_BIN_RESIZE_MODE,
     Y_ONLY_RESIZE_MODE,
@@ -141,6 +141,19 @@ def parse_args():
     )
     parser.add_argument("--train-split", type=float, default=0.8, help="Fraction of data for training.")
     parser.add_argument("--val-split", type=float, default=0.2, help="Fraction of data for validation.")
+    parser.add_argument(
+        "--split-mode",
+        choices=["group", "image"],
+        default="group",
+        help="group: keep video sequences / copies of the same COCO image on one side of the split (no leakage). "
+        "image: legacy per-image shuffle.",
+    )
+    parser.add_argument(
+        "--split-group-regex",
+        default=None,
+        help="Regex searched in each file stem to define split groups (group(1) if present). "
+        "Default auto: COCO 12-digit id (incl. prefixes like dist_), else '<seq>_<frame>' -> <seq>.",
+    )
     parser.add_argument(
         "--img-size",
         default="64x64",
@@ -275,6 +288,14 @@ def parse_args():
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=1)
     parser.add_argument("--conf-thresh", type=float, default=0.15)
+    parser.add_argument(
+        "--eval-conf-thresh",
+        type=float,
+        default=0.001,
+        help="Score threshold for detections fed to mAP / COCO eval (low, so the PR curve is not truncated). "
+        "--conf-thresh still controls rendered validation samples. Set equal to --conf-thresh for legacy numbers.",
+    )
+    parser.add_argument("--eval-max-det", type=int, default=100, help="Max detections per image kept for mAP / COCO eval.")
     parser.add_argument("--topk", type=int, default=50, help="Top-K for CNN decoding.")
     parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision training.")
     parser.add_argument("--qat", action="store_true", help="Enable QAT via torch.ao.quantization.")
@@ -1009,13 +1030,14 @@ def make_datasets(args, class_ids, aug_cfg, val_aug_cfg, resize_mode: str):
     items = list(base.items)
     if args.train_split + args.val_split > 1.0 + 1e-6:
         raise ValueError("train-split + val-split must be <= 1.0")
-    rng = random.Random(args.seed)
-    rng.shuffle(items)
-    n = len(items)
-    n_train = int(n * args.train_split)
-    n_val = int(n * args.val_split)
-    train_items = items[:n_train]
-    val_items = items[n_train : n_train + n_val]
+    train_items, val_items = split_items(
+        items,
+        train_frac=args.train_split,
+        val_frac=args.val_split,
+        seed=args.seed,
+        mode=args.split_mode,
+        group_regex=args.split_group_regex,
+    )
     if not val_items:
         raise ValueError("Validation split produced no samples; adjust train-split/val-split.")
 
@@ -1964,8 +1986,13 @@ def validate(
     loss_weight_quality: float = 1.0,
     obj_loss_type: str = "bce",
     obj_target: str = "auto",
+    eval_conf_thresh: Optional[float] = None,
+    eval_max_det: int = 100,
 ) -> Dict[str, float]:
     model.eval()
+    # Detections for mAP/COCO use a low threshold so the PR curve is not truncated;
+    # conf_thresh only filters what is drawn in the saved validation samples.
+    decode_thresh = conf_thresh if eval_conf_thresh is None else min(float(conf_thresh), float(eval_conf_thresh))
     all_preds = []
     all_targets = []
     sample_count = 0
@@ -2185,8 +2212,9 @@ def validate(
                                 outputs,
                                 anchors=anchors,
                                 num_classes=det_num_classes,
-                                conf_thresh=conf_thresh,
+                                conf_thresh=decode_thresh,
                                 nms_thresh=0.5,
+                                pre_nms_topk=1000,
                                 has_quality=use_quality_head,
                                 wh_scale=wh_scale_tensor,
                                 score_mode=score_mode or "obj_quality_cls",
@@ -2199,8 +2227,9 @@ def validate(
                                     outputs,
                                     anchors=anchors,
                                     num_classes=attr_num_classes,
-                                    conf_thresh=conf_thresh,
+                                    conf_thresh=decode_thresh,
                                     nms_thresh=0.5,
+                                    pre_nms_topk=1000,
                                     has_quality=use_quality_head,
                                     wh_scale=wh_scale_tensor,
                                     score_mode=score_mode or "obj_quality_cls",
@@ -2214,11 +2243,11 @@ def validate(
                                 preds = det_preds
                         else:
                             loss_dict = centernet_loss(outputs, targets_dev, num_classes=num_classes)
-                            preds = decode_centernet(outputs, conf_thresh=conf_thresh, topk=topk)
+                            preds = decode_centernet(outputs, conf_thresh=decode_thresh, topk=max(topk, eval_max_det))
                     else:
                         logits, box_pred = model(imgs)
                         loss_dict = detr_loss(logits, box_pred, targets_dev, num_classes=num_classes)
-                        preds = decode_detr(logits, box_pred, conf_thresh=conf_thresh)
+                        preds = decode_detr(logits, box_pred, conf_thresh=decode_thresh)
                 # accumulate losses
                 total_loss += float(loss_dict["loss"].item())
                 if arch_cnn_like:
@@ -2239,6 +2268,8 @@ def validate(
                     total_l1 += float(loss_dict["l1"].item())
                     total_iou += float(loss_dict["iou"].item())
                 steps += 1
+                # keep the top eval_max_det detections per image (COCO maxDets convention)
+                preds = [sorted(p_img, key=lambda d: d[0], reverse=True)[:eval_max_det] for p_img in preds]
                 # move predictions to CPU for metric computation
                 preds_cpu = []
                 for p_img in preds:
@@ -2261,7 +2292,8 @@ def validate(
                             sample_out_dir = sample_dir
                             save_path = os.path.join(sample_dir, f"{save_stem}.png")
                         img_tensor = imgs[b_idx] if sample_from_inputs else None
-                        orig_size = render_sample(img_path, pred_img, save_path, img_tensor=img_tensor)
+                        vis_preds = [d for d in pred_img if d[0] >= conf_thresh]
+                        orig_size = render_sample(img_path, vis_preds, save_path, img_tensor=img_tensor)
                         if enable_heatmap and heatmap_ctx is not None:
                             local_idx = heatmap_ctx["index_map"].get(b_idx)
                             if local_idx is not None:
@@ -2332,9 +2364,10 @@ def validate(
             metrics["cls"] = total_cls / steps
             metrics["l1"] = total_l1 / steps
             metrics["iou"] = total_iou / steps
-            if coco_eval:
-                coco_metrics = run_coco_eval(coco_images, coco_annos, coco_dets, class_ids or list(range(num_classes)), per_class=coco_per_class)
-                metrics.update(coco_metrics)
+    # COCO eval applies to every architecture (previously it only ran for the transformer branch).
+    if coco_eval:
+        coco_metrics = run_coco_eval(coco_images, coco_annos, coco_dets, class_ids or list(range(num_classes)), per_class=coco_per_class)
+        metrics.update(coco_metrics)
     return metrics
 
 
@@ -2486,8 +2519,8 @@ def main():
     if args.val_only and not (args.resume or args.ckpt):
         raise ValueError("--val-only requires either --resume or --ckpt to load weights.")
 
-    pretrain_meta = torch.load(args.ckpt, map_location="cpu") if args.ckpt else None
-    ckpt_meta = torch.load(args.resume, map_location="cpu") if args.resume else None
+    pretrain_meta = safe_torch_load(args.ckpt, map_location="cpu") if args.ckpt else None
+    ckpt_meta = safe_torch_load(args.resume, map_location="cpu") if args.resume else None
     img_h, img_w = parse_img_size(args.img_size)
     img_size_str = f"{img_h}x{img_w}"
 
@@ -3092,7 +3125,7 @@ def main():
     best_map = float("-inf")
 
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = safe_torch_load(args.resume, map_location=device)
         if args.qat:
             _load_with_log(model, ckpt["model"], strict=False, label="resume model (qat)")
         else:
@@ -3161,7 +3194,7 @@ def main():
     )
     teacher_model = None
     if teacher_ckpt and not args.val_only:
-        t_meta = torch.load(teacher_ckpt, map_location="cpu")
+        t_meta = safe_torch_load(teacher_ckpt, map_location="cpu")
         t_arch = (teacher_arch or t_meta.get("arch", args.arch)).lower()
         teacher_model_arch = t_arch
         if t_arch == "transformer":
@@ -3387,6 +3420,8 @@ def main():
             device=device,
             arch=args.arch,
             conf_thresh=args.conf_thresh,
+            eval_conf_thresh=args.eval_conf_thresh,
+            eval_max_det=args.eval_max_det,
             topk=args.topk,
             iou_thresh=0.5,
             use_amp=use_amp,
@@ -3537,6 +3572,8 @@ def main():
                 device=device,
                 arch=args.arch,
                 conf_thresh=args.conf_thresh,
+                eval_conf_thresh=args.eval_conf_thresh,
+                eval_max_det=args.eval_max_det,
                 topk=args.topk,
                 iou_thresh=0.5,
                 use_amp=use_amp,

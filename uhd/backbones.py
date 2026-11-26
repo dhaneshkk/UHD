@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .utils import safe_torch_load
+
 
 def _get_2d_sincos_pos_embed(h: int, w: int, dim: int) -> torch.Tensor:
     """2D sine-cosine positional embedding, not trainable."""
@@ -210,7 +212,7 @@ def load_dinov3_backbone(
             out[new_k] = v
         return out
 
-    state = torch.load(ckpt_path, map_location="cpu")
+    state = safe_torch_load(ckpt_path, map_location="cpu")
     if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
         # deimv2 finetune checkpoints store weights under model with backbone prefixes
         state = state["model"]

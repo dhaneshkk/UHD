@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from uhd.ultratinyod import UltraTinyOD, UltraTinyODConfig
+from uhd.utils import safe_torch_load
 from uhd.resize import Y_BIN_RESIZE_MODE, Y_ONLY_RESIZE_MODE, Y_TRI_RESIZE_MODE, YUV422_RESIZE_MODE, normalize_resize_mode
 
 
@@ -27,7 +28,7 @@ def _is_state_dict(obj) -> bool:
 
 def load_checkpoint(path: str) -> Tuple[Dict[str, torch.Tensor], Dict]:
     """Returns (state_dict, meta)."""
-    ckpt = torch.load(path, map_location="cpu")
+    ckpt = safe_torch_load(path, map_location="cpu")
     meta: Dict = ckpt if isinstance(ckpt, dict) else {}
     state: Optional[Dict[str, torch.Tensor]] = None
     if isinstance(ckpt, dict):

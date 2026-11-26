@@ -24,12 +24,12 @@ from esp_ppq.IR import BaseGraph, QuantableOperation, TrainableGraph
 from esp_ppq.parser import NativeExporter
 
 try:
-    from uhd.data import YoloDataset, detection_collate
+    from uhd.data import YoloDataset, detection_collate, split_items
     from uhd.losses import anchor_loss
     from uhd.metrics import decode_anchor, evaluate_map
     from uhd.utils import default_device, ensure_dir, move_targets, set_seed
 except ImportError:
-    from data import YoloDataset, detection_collate # ty: ignore
+    from data import YoloDataset, detection_collate, split_items # ty: ignore
     from losses import anchor_loss # ty: ignore
     from metrics import decode_anchor, evaluate_map # ty: ignore
     from utils import default_device, ensure_dir, move_targets, set_seed # ty: ignore
@@ -624,7 +624,9 @@ class QATTrainer:
                 wh_scale=self.wh_scale,
                 score_mode=score_mode,
                 quality_power=quality_power,
+                pre_nms_topk=1000,
             )
+            decoded = [sorted(p, key=lambda d: d[0], reverse=True)[:100] for p in decoded]
             preds.extend(decoded)
             targets.extend(tgt)
         metrics = evaluate_map(preds, targets, num_classes=self.eval_num_classes, iou_thresh=iou_thresh)
@@ -703,6 +705,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-prefix", default=None, help="Prefix for saved model files.")
     parser.add_argument("--no-eval", action="store_true", help="Skip evaluation.")
     parser.add_argument("--conf-thresh", type=float, default=0.15)
+    parser.add_argument(
+        "--eval-conf-thresh",
+        type=float,
+        default=0.001,
+        help="Score threshold for detections fed to mAP (low, so the PR curve is not truncated).",
+    )
+    parser.add_argument("--split-mode", choices=["group", "image"], default="group",
+                        help="group: no video-sequence / COCO-copy leakage across train/val. image: legacy shuffle.")
+    parser.add_argument("--split-group-regex", default=None, help="Regex on file stem defining split groups.")
     parser.add_argument("--nms-thresh", type=float, default=0.5)
     parser.add_argument("--iou-thresh", type=float, default=0.5)
     parser.add_argument("--score-mode", default="obj_quality_cls")
@@ -776,11 +787,15 @@ def main() -> None:
             class_ids=class_ids,
         )
         items = list(base_dataset.items)
-        rng = random.Random(int(args.seed))
-        rng.shuffle(items)
-        split_idx = int(len(items) * (1.0 - float(args.val_split))) if args.val_split else len(items)
-        train_items = items[:split_idx]
-        val_items = items[split_idx:] if args.val_split and args.val_split > 0 else []
+        val_frac = float(args.val_split) if args.val_split else 0.0
+        train_items, val_items = split_items(
+            items,
+            train_frac=1.0 - val_frac,
+            val_frac=val_frac,
+            seed=int(args.seed),
+            mode=args.split_mode,
+            group_regex=args.split_group_regex,
+        )
         if args.val_split and args.val_split > 0 and not val_items:
             raise ValueError("Validation split produced no samples; adjust --val-split.")
 
@@ -992,7 +1007,7 @@ def main() -> None:
         if val_loader is not None and not args.no_eval:
             current_metric = trainer.eval(
                 val_loader,
-                conf_thresh=float(args.conf_thresh),
+                conf_thresh=float(args.eval_conf_thresh),
                 nms_thresh=float(args.nms_thresh),
                 score_mode=str(score_mode),
                 quality_power=float(args.quality_power),
