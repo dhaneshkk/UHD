@@ -1,6 +1,7 @@
 import glob
 import os
 import random
+import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -57,6 +58,95 @@ def _read_label(path: str, class_to_idx: Dict[int, int]) -> List[Tuple[int, floa
             x, y, w, h = map(float, parts[1:5])
             boxes.append((cid, x, y, w, h))
     return boxes
+
+
+# 12-digit zero-padded MS-COCO image id, optionally behind alphabetic prefixes such as
+# "dist_" (augmented copies of the same COCO image must land on the same side of the split).
+_COCO_ID_RE = re.compile(r"^(?:[A-Za-z]+_)*(\d{12})$")
+# Video-like naming "<sequence>_<frame>" / "<sequence>-<frame>", e.g. "frame6_000286".
+_SEQ_FRAME_RE = re.compile(r"^(.+?)[_-]\d+$")
+
+
+def split_group_key(img_path: str, group_regex: Optional[str] = None) -> str:
+    """Return the leakage group for an image.
+
+    Images sharing a key are always placed on the same side of the train/val split.
+    - group_regex: applied with re.search to the file stem; group(1) if it has a group,
+      otherwise the whole match. Non-matching stems form their own group.
+    - default ("auto"): COCO ids (incl. prefixed copies like dist_<id>) group by id;
+      "<seq>_<frame>" names group by <seq>; anything else is its own group.
+    """
+    stem = os.path.splitext(os.path.basename(img_path))[0]
+    if group_regex:
+        m = re.search(group_regex, stem)
+        if not m:
+            return f"stem:{stem}"
+        return f"re:{m.group(1) if m.groups() else m.group(0)}"
+    m = _COCO_ID_RE.match(stem)
+    if m:
+        return f"coco:{m.group(1)}"
+    m = _SEQ_FRAME_RE.match(stem)
+    if m:
+        return f"seq:{m.group(1)}"
+    return f"stem:{stem}"
+
+
+def split_items(
+    items: Sequence[Tuple[str, str]],
+    train_frac: float,
+    val_frac: float,
+    seed: int,
+    mode: str = "group",
+    group_regex: Optional[str] = None,
+    verbose: bool = True,
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """Deterministic train/val split.
+
+    mode="image": legacy per-image shuffle (adjacent video frames can leak across splits).
+    mode="group": whole groups (see split_group_key) are assigned to one side, so near-duplicate
+    frames never appear in both train and val. Targets are met approximately (group granularity).
+    """
+    if train_frac < 0 or val_frac < 0 or train_frac + val_frac > 1.0 + 1e-6:
+        raise ValueError("train/val fractions must be >= 0 and sum to <= 1.0")
+    items = sorted(items)
+    n = len(items)
+    n_train = int(n * train_frac)
+    n_val = int(n * val_frac)
+    rng = random.Random(seed)
+    if mode == "image":
+        rng.shuffle(items)
+        return items[:n_train], items[n_train : n_train + n_val]
+    if mode != "group":
+        raise ValueError(f"Unknown split mode: {mode}")
+
+    groups: Dict[str, List[Tuple[str, str]]] = {}
+    for it in items:
+        groups.setdefault(split_group_key(it[0], group_regex), []).append(it)
+    keys = sorted(groups.keys())
+    rng.shuffle(keys)
+    largest = max((len(v) for v in groups.values()), default=0)
+    if n_val > 0 and largest > max(n_train, n_val):
+        raise ValueError(
+            f"Group split: largest group has {largest} images, more than the train ({n_train}) or val "
+            f"({n_val}) target. The auto grouping is probably merging unrelated images; pass "
+            "--split-group-regex to define sequences, or --split-mode image for the legacy split."
+        )
+    train: List[Tuple[str, str]] = []
+    val: List[Tuple[str, str]] = []
+    for k in keys:
+        g = groups[k]
+        if len(val) < n_val:
+            val.extend(g)
+        elif len(train) < n_train:
+            train.extend(g)
+        # else: dropped, matching the legacy behaviour when train+val < 1.0
+    if verbose:
+        n_multi = sum(1 for v in groups.values() if len(v) > 1)
+        print(
+            f"[split] mode=group: {len(groups)} groups ({n_multi} with >1 image, largest={largest}) -> "
+            f"train={len(train)} val={len(val)} (targets {n_train}/{n_val})"
+        )
+    return train, val
 
 
 class YoloDataset(Dataset):
@@ -164,7 +254,9 @@ class YoloDataset(Dataset):
         else:
             patterns = ["*.jpg", "*.jpeg", "*.png"]
             for pat in patterns:
-                for img_path in glob.glob(os.path.join(self.image_dir, pat)):
+                # sorted(): glob order is filesystem-dependent, which made the seeded split
+                # differ between machines.
+                for img_path in sorted(glob.glob(os.path.join(self.image_dir, pat))):
                     label_path = os.path.splitext(img_path)[0] + ".txt"
                     pairs.append((img_path, label_path))
 

@@ -823,6 +823,10 @@ uv run python train.py \
 
 </details>
 
+## Checkpoint loading
+
+Checkpoints are loaded with `torch.load(..., weights_only=True)`, which refuses pickled code. UHD's own checkpoints load normally. For a third-party checkpoint you trust that needs full unpickling, set `UHD_TRUST_CHECKPOINTS=1`.
+
 ## Validation-only Example
 
 <details><summary>Click to expand</summary>
@@ -860,6 +864,8 @@ overlayed on the detection image.
 | `--val-list` | Optional validation list file (one image path per line); requires `--train-list` and ignores split ratios. | `None` |
 | `--train-split` | Fraction of data used for training. | `0.8` |
 | `--val-split` | Fraction of data used for validation. | `0.2` |
+| `--split-mode` | `group`: copies of the same COCO image (e.g. `dist_<id>`) and frames of the same video sequence (`<seq>_<frame>`) always land on the same side of the split, preventing train/val leakage. `image`: legacy per-image shuffle. | `group` |
+| `--split-group-regex` | Regex searched in each file stem to define split groups (`group(1)` if present), overriding the automatic grouping. | `None` |
 | `--img-size` | Input size `HxW` (e.g., `64x64`). | `64x64` |
 | `--resize-mode` | Resize mode for training preprocessing: `torch_bilinear`, `torch_nearest`, `opencv_inter_linear`, `opencv_inter_nearest`, `opencv_inter_nearest_y`, `opencv_inter_nearest_y_bin`, `opencv_inter_nearest_y_tri`, `opencv_inter_nearest_yuv422`. | `torch_bilinear` |
 | `--torch_bilinear` | Shortcut for `--resize-mode torch_bilinear`. | `False` |
@@ -913,7 +919,9 @@ overlayed on the detection image.
 | `--seed` | Random seed. | `42` |
 | `--log-interval` | Steps between logging to progress bar. | `10` |
 | `--eval-interval` | Epoch interval for evaluation. | `1` |
-| `--conf-thresh` | Confidence threshold for decoding. | `0.3` |
+| `--conf-thresh` | Confidence threshold for rendered validation samples / visualization. | `0.15` |
+| `--eval-conf-thresh` | Score threshold for detections used in mAP / COCO eval. Kept low so the precision-recall curve is not truncated (set equal to `--conf-thresh` to reproduce legacy numbers). | `0.001` |
+| `--eval-max-det` | Max detections per image kept for mAP / COCO eval. | `100` |
 | `--topk` | Top-K for CNN decoding. | `50` |
 | `--use-amp` | Enable automatic mixed precision. | `False` |
 | `--qat` | Enable QAT via `torch.ao.quantization`. | `False` |
@@ -933,7 +941,7 @@ overlayed on the detection image.
 | `--aug-config` | YAML for augmentations (applied in listed order). | `uhd/aug.yaml` |
 | `--use-ema` | Enable EMA of model weights for evaluation/checkpointing. | `False` |
 | `--ema-decay` | EMA decay factor (ignored if EMA disabled). | `0.9998` |
-| `--coco-eval` | Run COCO-style evaluation. | `False` |
+| `--coco-eval` | Run COCO-style evaluation (all architectures). | `False` |
 | `--coco-per-class` | Log per-class COCO AP when COCO eval is enabled. | `False` |
 | `--classes` | Comma-separated target class IDs. | `0` |
 | `--activation` | Activation function (`relu` or `swish`). | `swish` |
@@ -1497,7 +1505,7 @@ as `.espdl` and `.native`.
 - Equalization: `--no-equalization`, `--equalization-iterations`, `--equalization-value-threshold`, `--equalization-opt-level`
 - Anchor head: `--use-quality`, `--no-quality`, `--iou-loss`, `--anchor-assigner`, `--anchor-cls-loss`, `--simota-topk`
 - Training: `--epochs`, `--lr`, `--momentum`, `--weight-decay`, `--seed`, `--device`
-- Eval/output: `--no-eval`, `--conf-thresh`, `--nms-thresh`, `--iou-thresh`, `--score-mode`, `--quality-power`, `--save-dir`, `--output-prefix`
+- Eval/output: `--no-eval`, `--conf-thresh`, `--eval-conf-thresh`, `--nms-thresh`, `--iou-thresh`, `--score-mode`, `--quality-power`, `--save-dir`, `--output-prefix`
 
 </details>
 

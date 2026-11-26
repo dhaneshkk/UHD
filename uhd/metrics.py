@@ -2,7 +2,11 @@ from typing import Dict, Iterable, List, Sequence, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
-import torch.nn.functional as F
+
+try:
+    from torchvision.ops import batched_nms as _tv_batched_nms
+except Exception:  # torchvision optional; fall back to the pure-python NMS
+    _tv_batched_nms = None
 
 from .losses import box_iou, cxcywh_to_xyxy
 
@@ -74,11 +78,22 @@ def decode_anchor(
     multi_label: bool = False,
     cls_logits_override: Optional[torch.Tensor] = None,
     class_offset: int = 0,
+    pre_nms_topk: Optional[int] = None,
 ) -> List[List[Tuple[float, int, torch.Tensor]]]:
     """
     YOLO-style decoding: pred shape B x (A*(5+Q+C)) x H x W, anchors A x 2 (normalized w,h).
     Q=1 when has_quality=True (obj+quality), otherwise 0.
+    pre_nms_topk: keep at most this many highest-scoring candidates (per class in multi_label mode)
+    before NMS; bounds cost when conf_thresh is very low (mAP evaluation).
     """
+
+    def _topk_mask(scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if pre_nms_topk is None or int(mask.sum()) <= pre_nms_topk:
+            return mask
+        masked = torch.where(mask, scores, torch.full_like(scores, float("-inf")))
+        keep = torch.zeros_like(mask)
+        keep.view(-1)[torch.topk(masked.reshape(-1), int(pre_nms_topk)).indices] = True
+        return keep & mask
 
     def _activate_wh(tw: torch.Tensor, th: torch.Tensor, max_scale: float = None) -> Tuple[torch.Tensor, torch.Tensor]:
         w = F.softplus(tw)
@@ -178,6 +193,7 @@ def decode_anchor(
                 for cls_id in range(num_classes):
                     cls_scores = flat_scores[:, cls_id]
                     mask = cls_scores >= conf_thresh
+                    mask = _topk_mask(cls_scores, mask)
                     if not mask.any():
                         continue
                     idxs = mask.nonzero(as_tuple=False).squeeze(1)
@@ -197,6 +213,7 @@ def decode_anchor(
             else:
                 max_scores, max_cls = flat_scores.max(dim=1)
                 mask = max_scores >= conf_thresh
+                mask = _topk_mask(max_scores, mask)
                 if mask.any():
                     sel_scores = max_scores[mask]
                     sel_cls = max_cls[mask]
@@ -224,6 +241,7 @@ def decode_anchor(
                 mask = score_map >= conf_thresh
             else:
                 mask = score_map > 0.0
+            mask = _topk_mask(score_map, mask)
             if mask.any():
                 idxs = mask.nonzero(as_tuple=False)
                 a_idx = idxs[:, 0]
@@ -249,6 +267,12 @@ def nms_per_class(boxes: List[Tuple[float, int, torch.Tensor]], iou_thresh: floa
     """Apply per-class NMS on a list of (score, cls, box[cx,cy,w,h]) tuples."""
     if not boxes:
         return []
+    if _tv_batched_nms is not None:
+        scores_t = torch.tensor([float(b[0]) for b in boxes], dtype=torch.float32)
+        cls_t = torch.tensor([int(b[1]) for b in boxes], dtype=torch.int64)
+        boxes_t = torch.stack([b[2].float() for b in boxes], dim=0)
+        keep = _tv_batched_nms(cxcywh_to_xyxy(boxes_t), scores_t, cls_t, float(iou_thresh))  # sorted by score desc
+        return [boxes[int(i)] for i in keep]
     out: List[Tuple[float, int, torch.Tensor]] = []
     boxes_by_cls = {}
     for sc, cls, box in boxes:
@@ -337,6 +361,7 @@ def evaluate_map(
         matched_by_img.append(per_class_matched)
 
     ap_per_class = {}
+    no_gt_classes = set()
     for c in range(num_classes):
         class_preds = []
         npos = 0
@@ -345,6 +370,7 @@ def evaluate_map(
             npos += gt_cls_boxes.shape[0]
         if npos == 0:
             ap_per_class[c] = 0.0
+            no_gt_classes.add(c)
             continue
         # collect predictions of this class
         for img_idx, pred_img in enumerate(preds):
@@ -357,7 +383,10 @@ def evaluate_map(
             continue
         ap_per_class[c] = _average_precision(class_preds, iou_thresh, npos)
 
-    mAP = sum(ap_per_class.values()) / len(ap_per_class) if ap_per_class else 0.0
+    # Classes with no ground truth in the eval set are undefined, not 0 (COCO convention);
+    # excluding them avoids dragging the mean down in multi-class runs.
+    valid = [c for c in ap_per_class if c not in no_gt_classes]
+    mAP = sum(ap_per_class[c] for c in valid) / len(valid) if valid else 0.0
     out = {"mAP@0.5": mAP}
     for c, ap in ap_per_class.items():
         out[f"AP@0.5_class{c}"] = ap
