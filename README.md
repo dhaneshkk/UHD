@@ -823,6 +823,14 @@ uv run python train.py \
 
 </details>
 
+## SAM and MCC
+
+**SAM.** `--optimizer sam` wraps the base optimizer (`--sam-base`) with Sharpness-Aware Minimization. Each step computes the gradient at `w`, moves to `w + rho * g/||g||` (ASAM: `--sam-adaptive`), recomputes the full loss there (distillation included), restores `w` exactly and steps with the second gradient. BatchNorm running statistics are frozen during the perturbed pass. AMP/GradScaler, gradient clipping, EMA, LR schedules and resume all work, and checkpoints store the base optimizer state, so a SAM run can resume into AdamW/SGD and vice versa. A step costs about two forward/backward passes. The ESP-DL QAT script supports `--sam-rho` / `--sam-adaptive` too.
+
+**MCC.** Validation also reports thresholded metrics at `--conf-thresh` (the operating point you deploy), next to the threshold-free mAP:
+- `mcc@<thr>`: Matthews correlation coefficient. Box-level detection has no true negatives, so MCC uses a well-defined binary task. For every image, class and output-grid cell, truth means a GT box is centred in that cell and prediction means a detection with score >= threshold is centred there. Counts are pooled over classes.
+- `precision@<thr>`, `recall@<thr>`, `f1@<thr>`: box level, greedy one-to-one matching at IoU 0.5.
+
 ## Checkpoint loading
 
 Checkpoints are loaded with `torch.load(..., weights_only=True)`, which refuses pickled code. UHD's own checkpoints load normally. For a third-party checkpoint you trust that needs full unpickling, set `UHD_TRUST_CHECKPOINTS=1`.
@@ -912,7 +920,10 @@ overlayed on the detection image.
 | `--distill-feat` | Feature-map distillation weight (CNN only). | `0.0` |
 | `--lr` | Learning rate. | `0.001` |
 | `--weight-decay` | Weight decay. | `0.0001` |
-| `--optimizer` | Optimizer (`adamw` or `sgd`). | `adamw` |
+| `--optimizer` | Optimizer (`adamw`, `sgd`, or `sam` = Sharpness-Aware Minimization around `--sam-base`; ~2x step cost). | `adamw` |
+| `--sam-base` | Base optimizer wrapped by SAM (`adamw` or `sgd`). | `adamw` |
+| `--sam-rho` | SAM neighbourhood radius. ASAM typically needs a larger value (~0.5-2.0). | `0.05` |
+| `--sam-adaptive` | Use Adaptive SAM (ASAM, scale-invariant perturbation). | `False` |
 | `--grad-clip-norm` | Global gradient norm clip; set `0` to disable. | `5.0` |
 | `--num-workers` | DataLoader workers. | `8` |
 | `--device` | Device: `cuda` or `cpu`. | `cuda` if available |
@@ -922,6 +933,7 @@ overlayed on the detection image.
 | `--conf-thresh` | Confidence threshold for rendered validation samples / visualization. | `0.15` |
 | `--eval-conf-thresh` | Score threshold for detections used in mAP / COCO eval. Kept low so the precision-recall curve is not truncated (set equal to `--conf-thresh` to reproduce legacy numbers). | `0.001` |
 | `--eval-max-det` | Max detections per image kept for mAP / COCO eval. | `100` |
+| `--mcc-grid` | Grid size for cell-level MCC at `--conf-thresh`; `0` = the model's output grid (8x8 fallback). | `0` |
 | `--topk` | Top-K for CNN decoding. | `50` |
 | `--use-amp` | Enable automatic mixed precision. | `False` |
 | `--qat` | Enable QAT via `torch.ao.quantization`. | `False` |
@@ -1504,7 +1516,7 @@ as `.espdl` and `.native`.
 - Quant: `--target`, `--num-of-bits`, `--calib-steps`
 - Equalization: `--no-equalization`, `--equalization-iterations`, `--equalization-value-threshold`, `--equalization-opt-level`
 - Anchor head: `--use-quality`, `--no-quality`, `--iou-loss`, `--anchor-assigner`, `--anchor-cls-loss`, `--simota-topk`
-- Training: `--epochs`, `--lr`, `--momentum`, `--weight-decay`, `--seed`, `--device`
+- Training: `--epochs`, `--lr`, `--momentum`, `--weight-decay`, `--seed`, `--device`, `--sam-rho` (SAM for QAT; `0` = off), `--sam-adaptive`
 - Eval/output: `--no-eval`, `--conf-thresh`, `--eval-conf-thresh`, `--nms-thresh`, `--iou-thresh`, `--score-mode`, `--quality-power`, `--save-dir`, `--output-prefix`
 
 </details>

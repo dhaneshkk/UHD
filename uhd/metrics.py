@@ -391,3 +391,94 @@ def evaluate_map(
     for c, ap in ap_per_class.items():
         out[f"AP@0.5_class{c}"] = ap
     return out
+
+
+def mcc_from_counts(tp: int, fp: int, fn: int, tn: int) -> float:
+    """Matthews correlation coefficient; 0.0 when any marginal is empty (undefined case)."""
+    import math
+
+    num = tp * tn - fp * fn
+    den = math.sqrt(float(tp + fp) * float(tp + fn) * float(tn + fp) * float(tn + fn))
+    return float(num / den) if den > 0 else 0.0
+
+
+def evaluate_mcc(
+    preds: Sequence[Sequence[Tuple[float, int, torch.Tensor]]],
+    targets: Sequence[Dict[str, torch.Tensor]],
+    num_classes: int,
+    score_thresh: float,
+    grid_hw: Tuple[int, int] = (8, 8),
+    iou_thresh: float = 0.5,
+) -> Dict[str, float]:
+    """Thresholded detection metrics at a single operating point (score >= score_thresh).
+
+    Box-level detection has no true negatives, so MCC is computed on a well-defined binary task:
+    for every image x class x grid cell (default: the model's output grid), truth = "a GT box of
+    that class is centred in the cell", prediction = "a detection of that class with
+    score >= score_thresh is centred in the cell". Counts are pooled (micro) over classes.
+
+    Also reports box-level precision / recall / F1 at the same threshold, with greedy one-to-one
+    matching at iou_thresh (a detection can only match a GT of the same class).
+    """
+    gh, gw = int(grid_hw[0]), int(grid_hw[1])
+    cells = gh * gw
+    c_tp = c_fp = c_fn = c_tn = 0
+    b_tp = b_fp = b_fn = 0
+
+    def _cells(boxes: torch.Tensor) -> set:
+        if boxes.numel() == 0:
+            return set()
+        gx = (boxes[:, 0].clamp(0, 1 - 1e-6) * gw).long()
+        gy = (boxes[:, 1].clamp(0, 1 - 1e-6) * gh).long()
+        return set((gy * gw + gx).tolist())
+
+    for pred_img, tgt in zip(preds, targets):
+        gt_boxes = tgt["boxes"].detach().cpu().float()
+        gt_labels = tgt["labels"].detach().cpu()
+        kept = [(float(s), int(c), b.detach().cpu().float()) for s, c, b in pred_img if float(s) >= score_thresh]
+        for c in range(num_classes):
+            g = gt_boxes[gt_labels == c] if gt_boxes.numel() else gt_boxes.reshape(0, 4)
+            pc = sorted([(s, b) for s, cc, b in kept if cc == c], key=lambda x: x[0], reverse=True)
+            pb = torch.stack([b for _, b in pc]) if pc else torch.zeros((0, 4))
+            # cell-level confusion
+            t_cells, p_cells = _cells(g), _cells(pb)
+            tp = len(t_cells & p_cells)
+            fp = len(p_cells - t_cells)
+            fn = len(t_cells - p_cells)
+            c_tp += tp
+            c_fp += fp
+            c_fn += fn
+            c_tn += cells - tp - fp - fn
+            # box-level greedy matching
+            if pb.shape[0] == 0:
+                b_fn += g.shape[0]
+                continue
+            if g.shape[0] == 0:
+                b_fp += pb.shape[0]
+                continue
+            ious = box_iou(pb, g)
+            matched = torch.zeros(g.shape[0], dtype=torch.bool)
+            for i in range(pb.shape[0]):
+                row = ious[i].clone()
+                row[matched] = -1.0
+                j = int(torch.argmax(row))
+                if float(row[j]) >= iou_thresh:
+                    matched[j] = True
+                    b_tp += 1
+                else:
+                    b_fp += 1
+            b_fn += int((~matched).sum())
+
+    precision = b_tp / (b_tp + b_fp) if (b_tp + b_fp) else 0.0
+    recall = b_tp / (b_tp + b_fn) if (b_tp + b_fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return {
+        "mcc": mcc_from_counts(c_tp, c_fp, c_fn, c_tn),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "mcc_cells_tp": float(c_tp),
+        "mcc_cells_fp": float(c_fp),
+        "mcc_cells_fn": float(c_fn),
+        "mcc_cells_tn": float(c_tn),
+    }

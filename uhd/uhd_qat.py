@@ -26,12 +26,14 @@ from esp_ppq.parser import NativeExporter
 try:
     from uhd.data import YoloDataset, detection_collate, split_items
     from uhd.losses import anchor_loss
-    from uhd.metrics import decode_anchor, evaluate_map
+    from uhd.metrics import decode_anchor, evaluate_map, evaluate_mcc
+    from uhd.sam import SAM
     from uhd.utils import default_device, ensure_dir, move_targets, set_seed
 except ImportError:
     from data import YoloDataset, detection_collate, split_items # ty: ignore
     from losses import anchor_loss # ty: ignore
-    from metrics import decode_anchor, evaluate_map # ty: ignore
+    from metrics import decode_anchor, evaluate_map, evaluate_mcc # ty: ignore
+    from sam import SAM # ty: ignore
     from utils import default_device, ensure_dir, move_targets, set_seed # ty: ignore
 
 
@@ -518,6 +520,8 @@ class QATTrainer:
         lr: float = 1e-6,
         momentum: float = 0.937,
         weight_decay: float = 5e-4,
+        sam_rho: float = 0.0,
+        sam_adaptive: bool = False,
     ) -> None:
         self._epoch = 0
         self._step = 0
@@ -545,6 +549,9 @@ class QATTrainer:
             momentum=float(momentum),
             weight_decay=float(weight_decay),
         )
+        if sam_rho and float(sam_rho) > 0:
+            self._optimizer = SAM(self._optimizer, rho=float(sam_rho), adaptive=bool(sam_adaptive))
+            print(f"QAT optimizer: SAM(base=sgd, rho={sam_rho}, adaptive={bool(sam_adaptive)})")
         self._lr_scheduler = None
 
     def _extract_raw(self, outputs: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -572,25 +579,40 @@ class QATTrainer:
         imgs = imgs.to(self._device, non_blocking=True)
         targets_dev = move_targets(targets, self._device)
         self._optimizer.zero_grad()
-        outputs = self._executor.forward_with_gradient(imgs)
-        raw = self._extract_raw(outputs)
-        loss_dict = anchor_loss(
-            raw,
-            targets_dev,
-            anchors=self.anchors,
-            num_classes=self.num_classes,
-            iou_loss=self.iou_loss,
-            assigner=self.assigner,
-            cls_loss_type=self.cls_loss_type,
-            simota_topk=self.simota_topk,
-            use_quality=self.use_quality,
-            wh_scale=self.wh_scale,
-        )
-        loss = loss_dict["loss"]
+
+        def _forward_loss():
+            outputs = self._executor.forward_with_gradient(imgs)
+            raw = self._extract_raw(outputs)
+            loss_dict = anchor_loss(
+                raw,
+                targets_dev,
+                anchors=self.anchors,
+                num_classes=self.num_classes,
+                iou_loss=self.iou_loss,
+                assigner=self.assigner,
+                cls_loss_type=self.cls_loss_type,
+                simota_topk=self.simota_topk,
+                use_quality=self.use_quality,
+                wh_scale=self.wh_scale,
+            )
+            return raw, loss_dict["loss"]
+
+        raw, loss = _forward_loss()
         loss.backward()
         if self._lr_scheduler is not None:
             self._lr_scheduler.step(epoch=self._epoch)
-        self._optimizer.step()
+        if isinstance(self._optimizer, SAM):
+            # SAM: second gradient at the perturbed weights, then restore and step.
+            self._optimizer.first_step(zero_grad=True)
+            try:
+                _, loss2 = _forward_loss()
+                loss2.backward()
+            except Exception:
+                self._optimizer.restore()
+                raise
+            self._optimizer.second_step()
+        else:
+            self._optimizer.step()
         self._training_graph.zero_grad()
         self._step += 1
         return raw, loss.item()
@@ -603,9 +625,11 @@ class QATTrainer:
         score_mode: str = "obj_quality_cls",
         quality_power: float = 1.0,
         iou_thresh: float = 0.5,
+        mcc_thresh: float = 0.15,
     ) -> float:
         preds = []
         targets = []
+        raw = None
         for imgs, tgt in dataloader:
             imgs = imgs.to(self._device, non_blocking=True)
             with torch.no_grad():
@@ -631,7 +655,14 @@ class QATTrainer:
             targets.extend(tgt)
         metrics = evaluate_map(preds, targets, num_classes=self.eval_num_classes, iou_thresh=iou_thresh)
         map50 = float(metrics.get("mAP@0.5", 0.0))
-        print(f"Eval mAP@0.5: {map50:.4f}")
+        raw_hw = tuple(int(v) for v in raw.shape[-2:]) if raw is not None and raw.dim() == 4 else (8, 8)
+        mcc = evaluate_mcc(
+            preds, targets, num_classes=self.eval_num_classes, score_thresh=float(mcc_thresh), grid_hw=raw_hw, iou_thresh=iou_thresh
+        )
+        print(
+            f"Eval mAP@0.5: {map50:.4f} | @{mcc_thresh:g}: MCC={mcc['mcc']:.4f} "
+            f"P={mcc['precision']:.4f} R={mcc['recall']:.4f} F1={mcc['f1']:.4f}"
+        )
         return map50
 
     def save(self, espdl_path: str, native_path: str, platform: TargetPlatform) -> None:
@@ -711,6 +742,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.001,
         help="Score threshold for detections fed to mAP (low, so the PR curve is not truncated).",
     )
+    parser.add_argument("--sam-rho", type=float, default=0.0, help="Enable SAM for QAT with this rho (0 = plain SGD).")
+    parser.add_argument("--sam-adaptive", action="store_true", help="Use Adaptive SAM (ASAM) for QAT.")
     parser.add_argument("--split-mode", choices=["group", "image"], default="group",
                         help="group: no video-sequence / COCO-copy leakage across train/val. image: legacy shuffle.")
     parser.add_argument("--split-group-regex", default=None, help="Regex on file stem defining split groups.")
@@ -992,6 +1025,8 @@ def main() -> None:
         lr=args.lr,
         momentum=args.momentum,
         weight_decay=args.weight_decay,
+        sam_rho=args.sam_rho,
+        sam_adaptive=args.sam_adaptive,
     )
     param_snapshot_before = snapshot_trainable_params(trainer.graph)
     quant_snapshot_before = snapshot_quant_params(trainer.graph)
@@ -1008,6 +1043,7 @@ def main() -> None:
             current_metric = trainer.eval(
                 val_loader,
                 conf_thresh=float(args.eval_conf_thresh),
+                mcc_thresh=float(args.conf_thresh),
                 nms_thresh=float(args.nms_thresh),
                 score_mode=str(score_mode),
                 quality_power=float(args.quality_power),
