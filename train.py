@@ -21,9 +21,10 @@ from faster_coco_eval import COCO, COCOeval_faster
 
 from uhd.data import YoloDataset, detection_collate, split_items
 from uhd.losses import anchor_loss, anchor_attr_loss, centernet_loss, detr_loss
-from uhd.metrics import decode_anchor, decode_centernet, decode_detr, evaluate_map
+from uhd.metrics import decode_anchor, decode_centernet, decode_detr, evaluate_map, evaluate_mcc
 from uhd.backbones import load_dinov3_backbone
 from uhd.models import build_model
+from uhd.sam import SAM, sam_update
 from uhd.utils import default_device, ensure_dir, move_targets, safe_torch_load, set_seed
 from uhd.resize import (
     Y_BIN_RESIZE_MODE,
@@ -280,7 +281,16 @@ def parse_args():
     )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw", help="Optimizer to use (UltraTinyOD can benefit from SGD).")
+    parser.add_argument(
+        "--optimizer",
+        choices=["adamw", "sgd", "sam"],
+        default="adamw",
+        help="Optimizer to use (UltraTinyOD can benefit from SGD). 'sam' = Sharpness-Aware Minimization wrapping --sam-base "
+        "(2 forward/backward passes per step, ~2x step cost).",
+    )
+    parser.add_argument("--sam-base", choices=["adamw", "sgd"], default="adamw", help="Base optimizer wrapped by SAM.")
+    parser.add_argument("--sam-rho", type=float, default=0.05, help="SAM neighbourhood radius rho (ASAM typically uses ~0.5-2.0).")
+    parser.add_argument("--sam-adaptive", action="store_true", help="Use Adaptive SAM (ASAM, scale-invariant perturbation).")
     parser.add_argument("--grad-clip-norm", type=float, default=5.0, help="Global gradient norm clip value (0 to disable).")
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--device", default=None, help="cuda or cpu. Defaults to cuda if available.")
@@ -296,6 +306,12 @@ def parse_args():
         "--conf-thresh still controls rendered validation samples. Set equal to --conf-thresh for legacy numbers.",
     )
     parser.add_argument("--eval-max-det", type=int, default=100, help="Max detections per image kept for mAP / COCO eval.")
+    parser.add_argument(
+        "--mcc-grid",
+        type=int,
+        default=0,
+        help="Grid size (NxN) for cell-level MCC at --conf-thresh. 0 = the model's output grid (8x8 fallback).",
+    )
     parser.add_argument("--topk", type=int, default=50, help="Top-K for CNN decoding.")
     parser.add_argument("--use-amp", action="store_true", help="Enable automatic mixed precision training.")
     parser.add_argument("--qat", action="store_true", help="Enable QAT via torch.ao.quantization.")
@@ -1439,274 +1455,286 @@ def train_one_epoch(
     for step, (imgs, targets) in enumerate(pbar):
         imgs = imgs.to(device)
         targets_dev = move_targets(targets, device)
-        optimizer.zero_grad()
-        with torch.autocast(device_type=device.type, dtype=torch.float16 if device.type == "cuda" else torch.bfloat16, enabled=scaler.is_enabled()):
-            teacher_logits = None
-            teacher_boxes = None
-            teacher_feats = None
-            teacher_anchor_pred = None
-            teacher_ct_pred = None
-            student_feats = None
-            if teacher_model is not None:
-                with torch.no_grad():
-                    if (teacher_arch or "transformer") == "transformer":
-                        t_out = teacher_model(imgs)
-                        if isinstance(t_out, dict):
-                            teacher_logits = None
-                            teacher_boxes = None
-                        else:
-                            teacher_logits, teacher_boxes = t_out
-                    else:
-                        t_out = teacher_model(imgs, return_feat=True)
-                        if isinstance(t_out, tuple) and len(t_out) == 2:
-                            pred_part, feat_part = t_out
-                            teacher_feats = feat_part
-                            if isinstance(pred_part, dict):
-                                teacher_ct_pred = pred_part
+        def _forward_loss():
+            # Forward + full loss (incl. distillation). Called once per step, twice under SAM.
+            nonlocal warn_anchor_mismatch, warn_class_mismatch, warn_nonfinite_kl
+            with torch.autocast(device_type=device.type, dtype=torch.float16 if device.type == "cuda" else torch.bfloat16, enabled=scaler.is_enabled()):
+                teacher_logits = None
+                teacher_boxes = None
+                teacher_feats = None
+                teacher_anchor_pred = None
+                teacher_ct_pred = None
+                student_feats = None
+                if teacher_model is not None:
+                    with torch.no_grad():
+                        if (teacher_arch or "transformer") == "transformer":
+                            t_out = teacher_model(imgs)
+                            if isinstance(t_out, dict):
+                                teacher_logits = None
+                                teacher_boxes = None
                             else:
-                                teacher_anchor_pred = pred_part
-                        elif isinstance(t_out, dict):
-                            teacher_ct_pred = t_out
-            if teacher_backbone is not None and distill_feat > 0 and arch_cnn_like:
-                with torch.no_grad():
-                    imgs_t = imgs
-                    if teacher_backbone_norm == "imagenet":
-                        mean = torch.tensor([0.485, 0.456, 0.406], device=imgs.device, dtype=torch.float32).view(1, 3, 1, 1)
-                        std = torch.tensor([0.229, 0.224, 0.225], device=imgs.device, dtype=torch.float32).view(1, 3, 1, 1)
-                        imgs_t = imgs_t.float()
-                        imgs_t = (imgs_t - mean) / std
-                    teacher_feats = teacher_backbone(imgs_t)
-            if arch_cnn_like:
-                need_feats = teacher_feats is not None and distill_feat > 0
-                attr_logits = None
-                if multi_label_mode == "separate" and anchor_head and arch == "ultratinyod":
-                    if need_feats:
-                        outputs, student_feats, attr_logits = model(imgs, return_feat=True, return_attr=True)
+                                teacher_logits, teacher_boxes = t_out
+                        else:
+                            t_out = teacher_model(imgs, return_feat=True)
+                            if isinstance(t_out, tuple) and len(t_out) == 2:
+                                pred_part, feat_part = t_out
+                                teacher_feats = feat_part
+                                if isinstance(pred_part, dict):
+                                    teacher_ct_pred = pred_part
+                                else:
+                                    teacher_anchor_pred = pred_part
+                            elif isinstance(t_out, dict):
+                                teacher_ct_pred = t_out
+                if teacher_backbone is not None and distill_feat > 0 and arch_cnn_like:
+                    with torch.no_grad():
+                        imgs_t = imgs
+                        if teacher_backbone_norm == "imagenet":
+                            mean = torch.tensor([0.485, 0.456, 0.406], device=imgs.device, dtype=torch.float32).view(1, 3, 1, 1)
+                            std = torch.tensor([0.229, 0.224, 0.225], device=imgs.device, dtype=torch.float32).view(1, 3, 1, 1)
+                            imgs_t = imgs_t.float()
+                            imgs_t = (imgs_t - mean) / std
+                        teacher_feats = teacher_backbone(imgs_t)
+                if arch_cnn_like:
+                    need_feats = teacher_feats is not None and distill_feat > 0
+                    attr_logits = None
+                    if multi_label_mode == "separate" and anchor_head and arch == "ultratinyod":
+                        if need_feats:
+                            outputs, student_feats, attr_logits = model(imgs, return_feat=True, return_attr=True)
+                        else:
+                            outputs, attr_logits = model(imgs, return_attr=True)
+                        det_targets = filter_targets_by_class(targets_dev, det_class_map or {})
+                        attr_targets = filter_targets_by_class(targets_dev, attr_class_map or {})
                     else:
-                        outputs, attr_logits = model(imgs, return_attr=True)
-                    det_targets = filter_targets_by_class(targets_dev, det_class_map or {})
-                    attr_targets = filter_targets_by_class(targets_dev, attr_class_map or {})
-                else:
-                    outputs = model(imgs, return_feat=need_feats)
-                    if need_feats:
-                        outputs, student_feats = outputs
-                    det_targets = targets_dev
-                    attr_targets = None
-                if anchor_head:
-                    loss_dict = anchor_loss(
-                        outputs,
-                        det_targets,
-                        anchors=anchors,
-                        num_classes=num_classes,
-                        iou_loss=iou_loss_type,
-                        assigner=anchor_assigner,
-                        cls_loss_type=anchor_cls_loss,
-                        simota_topk=simota_topk,
-                        use_quality=use_quality_head,
-                        wh_scale=wh_scale_tensor,
-                        multi_label=multi_label_mode == "single",
-                        loss_weight_box=loss_weight_box,
-                        loss_weight_obj=loss_weight_obj,
-                        loss_weight_cls=loss_weight_cls,
-                        loss_weight_quality=loss_weight_quality,
-                        obj_loss_type=obj_loss_type,
-                        obj_target=obj_target,
-                    )
-                    if multi_label_mode == "separate" and attr_logits is not None and attr_num_classes > 0:
-                        attr_loss = anchor_attr_loss(
-                            attr_logits,
-                            attr_targets if attr_targets is not None else det_targets,
+                        outputs = model(imgs, return_feat=need_feats)
+                        if need_feats:
+                            outputs, student_feats = outputs
+                        det_targets = targets_dev
+                        attr_targets = None
+                    if anchor_head:
+                        loss_dict = anchor_loss(
+                            outputs,
+                            det_targets,
                             anchors=anchors,
-                            num_classes=attr_num_classes,
+                            num_classes=num_classes,
+                            iou_loss=iou_loss_type,
                             assigner=anchor_assigner,
+                            cls_loss_type=anchor_cls_loss,
                             simota_topk=simota_topk,
+                            use_quality=use_quality_head,
                             wh_scale=wh_scale_tensor,
+                            multi_label=multi_label_mode == "single",
+                            loss_weight_box=loss_weight_box,
+                            loss_weight_obj=loss_weight_obj,
+                            loss_weight_cls=loss_weight_cls,
+                            loss_weight_quality=loss_weight_quality,
+                            obj_loss_type=obj_loss_type,
+                            obj_target=obj_target,
                         )
-                        loss_dict["loss"] = loss_dict["loss"] + attr_loss_weight * attr_loss["attr"]
-                        loss_dict["attr"] = attr_loss["attr"]
-                else:
-                    loss_dict = centernet_loss(outputs, targets_dev, num_classes=num_classes)
-                if need_feats and student_feats is not None:
-                    t_feat = teacher_feats
-                    if t_feat is not None and t_feat.shape[2:] != student_feats.shape[2:]:
-                        t_feat = torch.nn.functional.interpolate(
-                            t_feat, size=student_feats.shape[2:], mode="bilinear", align_corners=False
-                        )
-                    if t_feat is not None:
-                        with torch.amp.autocast(device_type=device.type, enabled=False):
-                            s_in = student_feats.float()
-                            s_proj = feature_adapter(s_in) if feature_adapter is not None else s_in
-                            t_feat_f = t_feat.float()
-                            s_norm = F.normalize(torch.nan_to_num(s_proj), dim=1, eps=1e-6)
-                            t_norm = F.normalize(torch.nan_to_num(t_feat_f), dim=1, eps=1e-6)
-                            loss_feat = F.l1_loss(torch.nan_to_num(s_norm), torch.nan_to_num(t_norm), reduction="mean")
-                        loss_dict["loss"] = loss_dict["loss"] + (distill_feat * distill_scale) * loss_feat
-                        loss_dict["distill_feat"] = loss_feat
-                # CNN logit/box distillation from CNN teacher
-                if teacher_model is not None and (teacher_arch or "cnn") in ("cnn", "ultratinyod"):
-                    if anchor_head and teacher_use_anchor and teacher_anchor_pred is not None and anchors is not None and teacher_anchors is not None:
-                        t_nc = teacher_num_classes if teacher_num_classes is not None else num_classes
-                        if t_nc != num_classes:
-                            if not warn_class_mismatch:
-                                print(f"Teacher classes ({t_nc}) != student ({num_classes}); skipping logit/box distill for anchor head.")
-                                warn_class_mismatch = True
-                        else:
-                            t_na = teacher_anchors.shape[0]
-                            s_na = anchors.shape[0]
-                            if t_na != s_na:
-                                if not warn_anchor_mismatch:
-                                    print(f"Teacher anchors ({t_na}) != student ({s_na}); skipping anchor logit/box distill.")
-                                    warn_anchor_mismatch = True
+                        if multi_label_mode == "separate" and attr_logits is not None and attr_num_classes > 0:
+                            attr_loss = anchor_attr_loss(
+                                attr_logits,
+                                attr_targets if attr_targets is not None else det_targets,
+                                anchors=anchors,
+                                num_classes=attr_num_classes,
+                                assigner=anchor_assigner,
+                                simota_topk=simota_topk,
+                                wh_scale=wh_scale_tensor,
+                            )
+                            loss_dict["loss"] = loss_dict["loss"] + attr_loss_weight * attr_loss["attr"]
+                            loss_dict["attr"] = attr_loss["attr"]
+                    else:
+                        loss_dict = centernet_loss(outputs, targets_dev, num_classes=num_classes)
+                    if need_feats and student_feats is not None:
+                        t_feat = teacher_feats
+                        if t_feat is not None and t_feat.shape[2:] != student_feats.shape[2:]:
+                            t_feat = torch.nn.functional.interpolate(
+                                t_feat, size=student_feats.shape[2:], mode="bilinear", align_corners=False
+                            )
+                        if t_feat is not None:
+                            with torch.amp.autocast(device_type=device.type, enabled=False):
+                                s_in = student_feats.float()
+                                s_proj = feature_adapter(s_in) if feature_adapter is not None else s_in
+                                t_feat_f = t_feat.float()
+                                s_norm = F.normalize(torch.nan_to_num(s_proj), dim=1, eps=1e-6)
+                                t_norm = F.normalize(torch.nan_to_num(t_feat_f), dim=1, eps=1e-6)
+                                loss_feat = F.l1_loss(torch.nan_to_num(s_norm), torch.nan_to_num(t_norm), reduction="mean")
+                            loss_dict["loss"] = loss_dict["loss"] + (distill_feat * distill_scale) * loss_feat
+                            loss_dict["distill_feat"] = loss_feat
+                    # CNN logit/box distillation from CNN teacher
+                    if teacher_model is not None and (teacher_arch or "cnn") in ("cnn", "ultratinyod"):
+                        if anchor_head and teacher_use_anchor and teacher_anchor_pred is not None and anchors is not None and teacher_anchors is not None:
+                            t_nc = teacher_num_classes if teacher_num_classes is not None else num_classes
+                            if t_nc != num_classes:
+                                if not warn_class_mismatch:
+                                    print(f"Teacher classes ({t_nc}) != student ({num_classes}); skipping logit/box distill for anchor head.")
+                                    warn_class_mismatch = True
                             else:
-                                t_has_quality = bool(
-                                    getattr(teacher_model, "has_quality_head", getattr(teacher_model, "use_improved_head", False))
-                                )
-                                s_has_quality = use_quality_head
-                                t_boxes, t_cls_logits, t_obj_logit, t_quality_logit, th, tw = _decode_anchor_pred(
-                                    teacher_anchor_pred,
-                                    teacher_anchors.to(device),
-                                    t_nc,
-                                    has_quality=t_has_quality,
-                                    wh_scale=getattr(teacher_model.head, "wh_scale", None) if t_has_quality and hasattr(teacher_model, "head") else None,
-                                )
-                                s_boxes, s_cls_logits, s_obj_logit, s_quality_logit, sh, sw = _decode_anchor_pred(
-                                    outputs,
-                                    anchors,
-                                    num_classes,
-                                    has_quality=s_has_quality,
-                                    wh_scale=wh_scale_tensor if s_has_quality else None,
-                                )
-                                if (th, tw) != (sh, sw):
-                                    t_boxes = _interp_anchor_map(t_boxes, (sh, sw))
-                                    t_cls_logits = _interp_anchor_map(t_cls_logits, (sh, sw))
-                                    t_obj_logit = _interp_anchor_scores(t_obj_logit, (sh, sw))
-                                    if t_quality_logit is not None:
-                                        t_quality_logit = _interp_anchor_scores(t_quality_logit, (sh, sw))
-                                if distill_kl > 0 and num_classes > 0:
-                                    temp = max(distill_temperature, 1e-6)
-                                    if num_classes == 1:
-                                        with torch.amp.autocast(device_type=device.type, enabled=False):
-                                            t_prob = torch.sigmoid(torch.nan_to_num(t_cls_logits.detach() / temp))
-                                            s_logit = torch.nan_to_num(s_cls_logits / temp)
-                                            kl = torch.nn.functional.binary_cross_entropy_with_logits(
-                                                s_logit.reshape(-1),
-                                                t_prob.reshape(-1),
-                                                reduction="mean",
+                                t_na = teacher_anchors.shape[0]
+                                s_na = anchors.shape[0]
+                                if t_na != s_na:
+                                    if not warn_anchor_mismatch:
+                                        print(f"Teacher anchors ({t_na}) != student ({s_na}); skipping anchor logit/box distill.")
+                                        warn_anchor_mismatch = True
+                                else:
+                                    t_has_quality = bool(
+                                        getattr(teacher_model, "has_quality_head", getattr(teacher_model, "use_improved_head", False))
+                                    )
+                                    s_has_quality = use_quality_head
+                                    t_boxes, t_cls_logits, t_obj_logit, t_quality_logit, th, tw = _decode_anchor_pred(
+                                        teacher_anchor_pred,
+                                        teacher_anchors.to(device),
+                                        t_nc,
+                                        has_quality=t_has_quality,
+                                        wh_scale=getattr(teacher_model.head, "wh_scale", None) if t_has_quality and hasattr(teacher_model, "head") else None,
+                                    )
+                                    s_boxes, s_cls_logits, s_obj_logit, s_quality_logit, sh, sw = _decode_anchor_pred(
+                                        outputs,
+                                        anchors,
+                                        num_classes,
+                                        has_quality=s_has_quality,
+                                        wh_scale=wh_scale_tensor if s_has_quality else None,
+                                    )
+                                    if (th, tw) != (sh, sw):
+                                        t_boxes = _interp_anchor_map(t_boxes, (sh, sw))
+                                        t_cls_logits = _interp_anchor_map(t_cls_logits, (sh, sw))
+                                        t_obj_logit = _interp_anchor_scores(t_obj_logit, (sh, sw))
+                                        if t_quality_logit is not None:
+                                            t_quality_logit = _interp_anchor_scores(t_quality_logit, (sh, sw))
+                                    if distill_kl > 0 and num_classes > 0:
+                                        temp = max(distill_temperature, 1e-6)
+                                        if num_classes == 1:
+                                            with torch.amp.autocast(device_type=device.type, enabled=False):
+                                                t_prob = torch.sigmoid(torch.nan_to_num(t_cls_logits.detach() / temp))
+                                                s_logit = torch.nan_to_num(s_cls_logits / temp)
+                                                kl = torch.nn.functional.binary_cross_entropy_with_logits(
+                                                    s_logit.reshape(-1),
+                                                    t_prob.reshape(-1),
+                                                    reduction="mean",
+                                                ) * (temp * temp)
+                                        else:
+                                            t_prob = torch.nan_to_num(
+                                                (t_cls_logits.detach() / temp).softmax(dim=-1), nan=0.0, posinf=1.0, neginf=0.0
+                                            )
+                                            s_logprob = torch.nan_to_num(
+                                                (s_cls_logits / temp).log_softmax(dim=-1), nan=0.0, posinf=0.0, neginf=0.0
+                                            )
+                                            kl = torch.nn.functional.kl_div(
+                                                s_logprob.reshape(-1, num_classes),
+                                                t_prob.reshape(-1, num_classes),
+                                                reduction="batchmean",
                                             ) * (temp * temp)
-                                    else:
-                                        t_prob = torch.nan_to_num(
-                                            (t_cls_logits.detach() / temp).softmax(dim=-1), nan=0.0, posinf=1.0, neginf=0.0
-                                        )
-                                        s_logprob = torch.nan_to_num(
-                                            (s_cls_logits / temp).log_softmax(dim=-1), nan=0.0, posinf=0.0, neginf=0.0
-                                        )
-                                        kl = torch.nn.functional.kl_div(
-                                            s_logprob.reshape(-1, num_classes),
-                                            t_prob.reshape(-1, num_classes),
-                                            reduction="batchmean",
-                                        ) * (temp * temp)
-                                    if torch.isfinite(kl):
-                                        loss_dict["loss"] = loss_dict["loss"] + (distill_kl * distill_scale) * kl
-                                        loss_dict["distill_kl"] = kl
-                                    elif not warn_nonfinite_kl:
-                                        print("Non-finite anchor KL distill value; skipping this term for stability.")
-                                        warn_nonfinite_kl = True
-                                if distill_obj > 0:
-                                    temp = max(distill_temperature, 1e-6)
-                                    with torch.amp.autocast(device_type=device.type, enabled=False):
-                                        t_prob = torch.sigmoid(torch.nan_to_num(t_obj_logit.detach() / temp))
-                                        s_logit = torch.nan_to_num(s_obj_logit / temp)
-                                        obj_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                                            s_logit.reshape(-1),
-                                            t_prob.reshape(-1),
-                                            reduction="mean",
-                                        ) * (temp * temp)
-                                    if torch.isfinite(obj_loss):
-                                        loss_dict["loss"] = loss_dict["loss"] + (distill_obj * distill_scale) * obj_loss
-                                        loss_dict["distill_obj"] = obj_loss
-                                    elif not warn_nonfinite_kl:
-                                        print("Non-finite anchor obj distill value; skipping this term for stability.")
-                                        warn_nonfinite_kl = True
-                                if distill_quality > 0 and s_has_quality and t_has_quality:
-                                    if t_quality_logit is not None and s_quality_logit is not None:
+                                        if torch.isfinite(kl):
+                                            loss_dict["loss"] = loss_dict["loss"] + (distill_kl * distill_scale) * kl
+                                            loss_dict["distill_kl"] = kl
+                                        elif not warn_nonfinite_kl:
+                                            print("Non-finite anchor KL distill value; skipping this term for stability.")
+                                            warn_nonfinite_kl = True
+                                    if distill_obj > 0:
                                         temp = max(distill_temperature, 1e-6)
                                         with torch.amp.autocast(device_type=device.type, enabled=False):
-                                            t_prob = torch.sigmoid(torch.nan_to_num(t_quality_logit.detach() / temp))
-                                            s_logit = torch.nan_to_num(s_quality_logit / temp)
-                                            qual_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                                            t_prob = torch.sigmoid(torch.nan_to_num(t_obj_logit.detach() / temp))
+                                            s_logit = torch.nan_to_num(s_obj_logit / temp)
+                                            obj_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                                                 s_logit.reshape(-1),
                                                 t_prob.reshape(-1),
                                                 reduction="mean",
                                             ) * (temp * temp)
-                                        if torch.isfinite(qual_loss):
-                                            loss_dict["loss"] = loss_dict["loss"] + (distill_quality * distill_scale) * qual_loss
-                                            loss_dict["distill_quality"] = qual_loss
+                                        if torch.isfinite(obj_loss):
+                                            loss_dict["loss"] = loss_dict["loss"] + (distill_obj * distill_scale) * obj_loss
+                                            loss_dict["distill_obj"] = obj_loss
                                         elif not warn_nonfinite_kl:
-                                            print("Non-finite anchor quality distill value; skipping this term for stability.")
+                                            print("Non-finite anchor obj distill value; skipping this term for stability.")
                                             warn_nonfinite_kl = True
-                                if distill_box_l1 > 0:
-                                    l1d = torch.nn.functional.l1_loss(
-                                        torch.nan_to_num(s_boxes),
-                                        torch.nan_to_num(t_boxes.detach()),
-                                        reduction="mean",
-                                    )
+                                    if distill_quality > 0 and s_has_quality and t_has_quality:
+                                        if t_quality_logit is not None and s_quality_logit is not None:
+                                            temp = max(distill_temperature, 1e-6)
+                                            with torch.amp.autocast(device_type=device.type, enabled=False):
+                                                t_prob = torch.sigmoid(torch.nan_to_num(t_quality_logit.detach() / temp))
+                                                s_logit = torch.nan_to_num(s_quality_logit / temp)
+                                                qual_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                                                    s_logit.reshape(-1),
+                                                    t_prob.reshape(-1),
+                                                    reduction="mean",
+                                                ) * (temp * temp)
+                                            if torch.isfinite(qual_loss):
+                                                loss_dict["loss"] = loss_dict["loss"] + (distill_quality * distill_scale) * qual_loss
+                                                loss_dict["distill_quality"] = qual_loss
+                                            elif not warn_nonfinite_kl:
+                                                print("Non-finite anchor quality distill value; skipping this term for stability.")
+                                                warn_nonfinite_kl = True
+                                    if distill_box_l1 > 0:
+                                        l1d = torch.nn.functional.l1_loss(
+                                            torch.nan_to_num(s_boxes),
+                                            torch.nan_to_num(t_boxes.detach()),
+                                            reduction="mean",
+                                        )
+                                        loss_dict["loss"] = loss_dict["loss"] + (distill_box_l1 * distill_scale) * l1d
+                                        loss_dict["distill_box_l1"] = l1d
+                        elif (not anchor_head) and teacher_ct_pred is not None and isinstance(teacher_ct_pred, dict):
+                            t_hm = teacher_ct_pred.get("hm")
+                            t_off = teacher_ct_pred.get("off")
+                            t_wh = teacher_ct_pred.get("wh")
+                            sh, sw = outputs["hm"].shape[2], outputs["hm"].shape[3]
+                            if t_hm is not None:
+                                if t_hm.shape[1] != outputs["hm"].shape[1] and not warn_class_mismatch:
+                                    print(f"Teacher heatmap classes ({t_hm.shape[1]}) != student ({outputs['hm'].shape[1]}); skipping heatmap distill.")
+                                    warn_class_mismatch = True
+                                elif t_hm.shape[1] == outputs["hm"].shape[1] and distill_kl > 0:
+                                    t_hm_resized = torch.nn.functional.interpolate(t_hm, size=(sh, sw), mode="bilinear", align_corners=False)
+                                    s_prob = torch.clamp(outputs["hm"], 1e-6, 1 - 1e-6)
+                                    t_prob = torch.clamp(t_hm_resized.detach(), 1e-6, 1 - 1e-6)
+                                    kl = torch.nn.functional.kl_div(torch.log(s_prob), t_prob, reduction="batchmean")
+                                    loss_dict["loss"] = loss_dict["loss"] + (distill_kl * distill_scale) * kl
+                                    loss_dict["distill_kl"] = kl
+                            if distill_box_l1 > 0:
+                                comp = []
+                                if t_off is not None:
+                                    t_off_r = torch.nn.functional.interpolate(t_off, size=(sh, sw), mode="bilinear", align_corners=False)
+                                    comp.append(torch.nn.functional.l1_loss(outputs["off"], t_off_r.detach(), reduction="mean"))
+                                if t_wh is not None:
+                                    t_wh_r = torch.nn.functional.interpolate(t_wh, size=(sh, sw), mode="bilinear", align_corners=False)
+                                    comp.append(torch.nn.functional.l1_loss(outputs["wh"], t_wh_r.detach(), reduction="mean"))
+                                if comp:
+                                    l1d = sum(comp) / len(comp)
                                     loss_dict["loss"] = loss_dict["loss"] + (distill_box_l1 * distill_scale) * l1d
                                     loss_dict["distill_box_l1"] = l1d
-                    elif (not anchor_head) and teacher_ct_pred is not None and isinstance(teacher_ct_pred, dict):
-                        t_hm = teacher_ct_pred.get("hm")
-                        t_off = teacher_ct_pred.get("off")
-                        t_wh = teacher_ct_pred.get("wh")
-                        sh, sw = outputs["hm"].shape[2], outputs["hm"].shape[3]
-                        if t_hm is not None:
-                            if t_hm.shape[1] != outputs["hm"].shape[1] and not warn_class_mismatch:
-                                print(f"Teacher heatmap classes ({t_hm.shape[1]}) != student ({outputs['hm'].shape[1]}); skipping heatmap distill.")
-                                warn_class_mismatch = True
-                            elif t_hm.shape[1] == outputs["hm"].shape[1] and distill_kl > 0:
-                                t_hm_resized = torch.nn.functional.interpolate(t_hm, size=(sh, sw), mode="bilinear", align_corners=False)
-                                s_prob = torch.clamp(outputs["hm"], 1e-6, 1 - 1e-6)
-                                t_prob = torch.clamp(t_hm_resized.detach(), 1e-6, 1 - 1e-6)
-                                kl = torch.nn.functional.kl_div(torch.log(s_prob), t_prob, reduction="batchmean")
+                else:
+                    logits, box_pred = model(imgs)
+                    loss_dict = detr_loss(logits, box_pred, targets_dev, num_classes=num_classes)
+                    if teacher_logits is not None and teacher_boxes is not None:
+                        # KL distillation on logits (Q,B,C+1)
+                        if distill_kl > 0:
+                            temp = max(distill_temperature, 1e-6)
+                            t_prob = torch.nan_to_num((teacher_logits.detach() / temp).softmax(-1), nan=0.0, posinf=1.0, neginf=0.0)
+                            s_logprob = torch.nan_to_num((logits / temp).log_softmax(-1), nan=0.0, posinf=0.0, neginf=0.0)
+                            kl = torch.nn.functional.kl_div(s_logprob, t_prob, reduction="batchmean") * (temp * temp)
+                            if torch.isfinite(kl):
                                 loss_dict["loss"] = loss_dict["loss"] + (distill_kl * distill_scale) * kl
                                 loss_dict["distill_kl"] = kl
+                            elif not warn_nonfinite_kl:
+                                print("Non-finite transformer KL distill value; skipping this term for stability.")
+                                warn_nonfinite_kl = True
                         if distill_box_l1 > 0:
-                            comp = []
-                            if t_off is not None:
-                                t_off_r = torch.nn.functional.interpolate(t_off, size=(sh, sw), mode="bilinear", align_corners=False)
-                                comp.append(torch.nn.functional.l1_loss(outputs["off"], t_off_r.detach(), reduction="mean"))
-                            if t_wh is not None:
-                                t_wh_r = torch.nn.functional.interpolate(t_wh, size=(sh, sw), mode="bilinear", align_corners=False)
-                                comp.append(torch.nn.functional.l1_loss(outputs["wh"], t_wh_r.detach(), reduction="mean"))
-                            if comp:
-                                l1d = sum(comp) / len(comp)
-                                loss_dict["loss"] = loss_dict["loss"] + (distill_box_l1 * distill_scale) * l1d
-                                loss_dict["distill_box_l1"] = l1d
-            else:
-                logits, box_pred = model(imgs)
-                loss_dict = detr_loss(logits, box_pred, targets_dev, num_classes=num_classes)
-                if teacher_logits is not None and teacher_boxes is not None:
-                    # KL distillation on logits (Q,B,C+1)
-                    if distill_kl > 0:
-                        temp = max(distill_temperature, 1e-6)
-                        t_prob = torch.nan_to_num((teacher_logits.detach() / temp).softmax(-1), nan=0.0, posinf=1.0, neginf=0.0)
-                        s_logprob = torch.nan_to_num((logits / temp).log_softmax(-1), nan=0.0, posinf=0.0, neginf=0.0)
-                        kl = torch.nn.functional.kl_div(s_logprob, t_prob, reduction="batchmean") * (temp * temp)
-                        if torch.isfinite(kl):
-                            loss_dict["loss"] = loss_dict["loss"] + (distill_kl * distill_scale) * kl
-                            loss_dict["distill_kl"] = kl
-                        elif not warn_nonfinite_kl:
-                            print("Non-finite transformer KL distill value; skipping this term for stability.")
-                            warn_nonfinite_kl = True
-                    if distill_box_l1 > 0:
-                        l1d = torch.nn.functional.l1_loss(box_pred.detach(), teacher_boxes.detach(), reduction="mean")
-                        loss_dict["loss"] = loss_dict["loss"] + (distill_box_l1 * distill_scale) * l1d
-                        loss_dict["distill_box_l1"] = l1d
-            loss = loss_dict["loss"]
+                            l1d = torch.nn.functional.l1_loss(box_pred.detach(), teacher_boxes.detach(), reduction="mean")
+                            loss_dict["loss"] = loss_dict["loss"] + (distill_box_l1 * distill_scale) * l1d
+                            loss_dict["distill_box_l1"] = l1d
+                loss = loss_dict["loss"]
+            return loss, loss_dict
+
+        optimizer.zero_grad()
+        loss, loss_dict = _forward_loss()
         if not torch.isfinite(loss):
             if not warn_nonfinite_loss:
                 print(f"Non-finite loss detected at step {step}; skipping backward/optimizer step.")
                 warn_nonfinite_loss = True
             continue
-        if scaler.is_enabled():
+        if isinstance(optimizer, SAM):
+            if not sam_update(optimizer, scaler, loss, _forward_loss, model, clip_params, grad_clip_norm):
+                if not warn_nonfinite_loss:
+                    print(f"Non-finite SAM gradient/loss at step {step}; skipping optimizer step.")
+                    warn_nonfinite_loss = True
+                continue
+        elif scaler.is_enabled():
             scaler.scale(loss).backward()
             if grad_clip_norm and grad_clip_norm > 0:
                 scaler.unscale_(optimizer)
@@ -1988,8 +2016,11 @@ def validate(
     obj_target: str = "auto",
     eval_conf_thresh: Optional[float] = None,
     eval_max_det: int = 100,
+    mcc_grid: int = 0,
 ) -> Dict[str, float]:
     model.eval()
+    outputs = None
+    mcc_grid_hw: Optional[Tuple[int, int]] = (int(mcc_grid), int(mcc_grid)) if mcc_grid and mcc_grid > 0 else None
     # Detections for mAP/COCO use a low threshold so the PR curve is not truncated;
     # conf_thresh only filters what is drawn in the saved validation samples.
     decode_thresh = conf_thresh if eval_conf_thresh is None else min(float(conf_thresh), float(eval_conf_thresh))
@@ -2268,6 +2299,10 @@ def validate(
                     total_l1 += float(loss_dict["l1"].item())
                     total_iou += float(loss_dict["iou"].item())
                 steps += 1
+                if mcc_grid_hw is None and outputs is not None:
+                    ref = outputs.get("hm") if isinstance(outputs, dict) else outputs
+                    if torch.is_tensor(ref) and ref.dim() == 4:
+                        mcc_grid_hw = (int(ref.shape[-2]), int(ref.shape[-1]))
                 # keep the top eval_max_det detections per image (COCO maxDets convention)
                 preds = [sorted(p_img, key=lambda d: d[0], reverse=True)[:eval_max_det] for p_img in preds]
                 # move predictions to CPU for metric computation
@@ -2347,6 +2382,17 @@ def validate(
             handle.remove()
 
     metrics = evaluate_map(all_preds, all_targets, num_classes=num_classes, iou_thresh=iou_thresh)
+    # Thresholded operating-point metrics at the same score threshold used for deployment / samples.
+    mcc_metrics = evaluate_mcc(
+        all_preds,
+        all_targets,
+        num_classes=num_classes,
+        score_thresh=float(conf_thresh),
+        grid_hw=mcc_grid_hw or (8, 8),
+        iou_thresh=iou_thresh,
+    )
+    for k in ("mcc", "precision", "recall", "f1"):
+        metrics[f"{k}@{float(conf_thresh):g}"] = mcc_metrics[k]
     if steps > 0:
         metrics["loss"] = total_loss / steps
         if arch_cnn_like:
@@ -3106,7 +3152,8 @@ def main():
     params = list(model.parameters())
     if feature_adapter is not None and len(list(feature_adapter.parameters())) > 0:
         params += list(feature_adapter.parameters())
-    if args.optimizer == "sgd":
+    base_name = args.sam_base if args.optimizer == "sam" else args.optimizer
+    if base_name == "sgd":
         optimizer = torch.optim.SGD(
             params,
             lr=args.lr,
@@ -3116,6 +3163,12 @@ def main():
         )
     else:
         optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "sam":
+        optimizer = SAM(optimizer, rho=args.sam_rho, adaptive=args.sam_adaptive)
+        print(
+            f"Optimizer: SAM(base={base_name}, rho={args.sam_rho}, adaptive={args.sam_adaptive}); "
+            "BN running stats frozen on the perturbed pass."
+        )
     try:
         scaler = torch.amp.GradScaler(enabled=bool(use_amp and device.type == "cuda"))
     except TypeError:
@@ -3422,6 +3475,7 @@ def main():
             conf_thresh=args.conf_thresh,
             eval_conf_thresh=args.eval_conf_thresh,
             eval_max_det=args.eval_max_det,
+            mcc_grid=args.mcc_grid,
             topk=args.topk,
             iou_thresh=0.5,
             use_amp=use_amp,
@@ -3574,6 +3628,7 @@ def main():
                 conf_thresh=args.conf_thresh,
                 eval_conf_thresh=args.eval_conf_thresh,
                 eval_max_det=args.eval_max_det,
+                mcc_grid=args.mcc_grid,
                 topk=args.topk,
                 iou_thresh=0.5,
                 use_amp=use_amp,
